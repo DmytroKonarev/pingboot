@@ -19,6 +19,15 @@
   #overlay button { margin-top:18px; padding:14px 34px; font-size:20px; font-weight:700;
     border:none; border-radius:12px; background:#ffd54a; color:#2a1c4a; cursor:pointer; }
   .hidden { display:none !important; }
+  #board { margin-top:16px; width:min(88vw,340px); max-height:46vh; overflow-y:auto;
+    background:rgba(0,0,0,.25); border-radius:12px; padding:10px 12px; }
+  .board-title { color:#ffd54a; font-weight:800; font-size:18px; margin-bottom:8px; text-align:center; }
+  .board-row { display:flex; align-items:center; gap:8px; padding:5px 6px; border-radius:8px; font-size:15px; }
+  .board-row:nth-child(even) { background:rgba(255,255,255,.05); }
+  .board-row.me { background:rgba(255,213,74,.22); font-weight:700; }
+  .board-row .rank { width:28px; color:#ffd54a; text-align:right; }
+  .board-row .nm { flex:1; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .board-row .sc { font-variant-numeric:tabular-nums; color:#ffd54a; }
   #flash { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
     color:#ffd54a; font-size:34px; font-weight:800; text-shadow:0 3px 8px #000; pointer-events:none;
     opacity:0; transition:opacity .25s; }
@@ -39,7 +48,7 @@
 "use strict";
 // params passed by the bot via the Play button URL
 const P=new URLSearchParams(location.search);
-const REPORT={uid:P.get("uid"),cid:P.get("cid"),mid:P.get("mid"),iid:P.get("iid"),ep:P.get("ep")};
+const REPORT={uid:P.get("uid"),name:P.get("name"),cid:P.get("cid"),mid:P.get("mid"),iid:P.get("iid"),ep:P.get("ep"),top:P.get("top")};
 const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
 const hud=document.getElementById("hud"),overlay=document.getElementById("overlay"),startBtn=document.getElementById("startBtn"),flash=document.getElementById("flash");
 
@@ -275,15 +284,43 @@ function startGame(){reset();overlay.classList.add("hidden");running=true;reques
 async function gameOver(){running=false;
   overlay.querySelector("h1").textContent="Гру завершено";
   overlay.querySelectorAll("p").forEach(p=>p.remove());
+  const old=document.getElementById("board");if(old)old.remove();
   const a=document.createElement("p");a.textContent="Рівень: "+level;
-  const b=document.createElement("p");b.textContent="Бали: "+score;
+  const b=document.createElement("p");b.textContent="Твій рахунок: "+score;
   overlay.insertBefore(a,startBtn);overlay.insertBefore(b,startBtn);
   startBtn.textContent="Ще раз";overlay.classList.remove("hidden");
-  // report score to Telegram via the bot endpoint
+
+  // 1) send score, wait so the DB updates before we read the top
   if(REPORT.ep&&REPORT.uid&&score>0){
     try{
       await fetch(REPORT.ep,{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({uid:REPORT.uid,score:score,cid:REPORT.cid,mid:REPORT.mid,iid:REPORT.iid})});
+        body:JSON.stringify({uid:REPORT.uid,name:REPORT.name,score:score,
+          cid:REPORT.cid,mid:REPORT.mid,iid:REPORT.iid})});
+    }catch(e){}
+  }
+
+  // 2) fetch and render the leaderboard for this chat
+  if(REPORT.top&&(REPORT.cid||REPORT.iid)){
+    try{
+      const qs=new URLSearchParams();
+      if(REPORT.cid)qs.set("cid",REPORT.cid); else qs.set("iid",REPORT.iid);
+      const res=await fetch(REPORT.top+"?"+qs.toString());
+      const data=await res.json();
+      if(data&&data.ok&&data.top&&data.top.length){
+        const box=document.createElement("div");box.id="board";
+        const h=document.createElement("div");h.className="board-title";h.textContent="Таблиця лідерів";
+        box.appendChild(h);
+        data.top.forEach((row,i)=>{
+          const line=document.createElement("div");line.className="board-row";
+          const rank=document.createElement("span");rank.className="rank";rank.textContent=(i+1)+".";
+          const nm=document.createElement("span");nm.className="nm";nm.textContent=row.name;
+          const sc=document.createElement("span");sc.className="sc";sc.textContent=row.score;
+          if(String(row.name)===String(REPORT.name))line.classList.add("me");
+          line.appendChild(rank);line.appendChild(nm);line.appendChild(sc);
+          box.appendChild(line);
+        });
+        overlay.insertBefore(box,startBtn);
+      }
     }catch(e){}
   }
 }
