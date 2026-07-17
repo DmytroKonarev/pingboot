@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Ping Boot</title>
+<script src="https://telegram.org/js/games.js"></script>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#1a1230; overflow:hidden;
+    font-family:system-ui,sans-serif; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { background:linear-gradient(#241a44,#140d28); display:block; box-shadow:0 0 40px #000 inset; }
+  #hud { position:fixed; top:10px; left:0; right:0; text-align:center; color:#ffd54a;
+    font-size:20px; font-weight:700; text-shadow:0 2px 4px #000; pointer-events:none; }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; color:#fff; text-align:center; background:rgba(15,10,32,.85); }
+  #overlay h1 { color:#ffd54a; margin:0 0 8px; font-size:30px; }
+  #overlay p { margin:6px 0; opacity:.9; }
+  #overlay button { margin-top:18px; padding:14px 34px; font-size:20px; font-weight:700;
+    border:none; border-radius:12px; background:#ffd54a; color:#2a1c4a; cursor:pointer; }
+  .hidden { display:none !important; }
+  #flash { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#ffd54a; font-size:34px; font-weight:800; text-shadow:0 3px 8px #000; pointer-events:none;
+    opacity:0; transition:opacity .25s; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="hud"></div>
+<div id="flash"></div>
+<div id="overlay">
+  <h1>Ping Boot</h1>
+  <p>Розбий усі блоки ботинком.</p>
+  <p>Зачистив рівень — з'явиться новий візерунок.</p>
+  <p>Кожен дотик до ракетки прискорює гру.</p>
+  <button id="startBtn">Грати</button>
+</div>
+<script>
+"use strict";
+// params passed by the bot via the Play button URL
+const P=new URLSearchParams(location.search);
+const REPORT={uid:P.get("uid"),cid:P.get("cid"),mid:P.get("mid"),iid:P.get("iid"),ep:P.get("ep")};
+const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
+const hud=document.getElementById("hud"),overlay=document.getElementById("overlay"),startBtn=document.getElementById("startBtn"),flash=document.getElementById("flash");
+
+let W=0,H=0,DPR=1;
+function resize(){DPR=Math.min(window.devicePixelRatio||1,2);W=Math.min(window.innerWidth,520);H=window.innerHeight;
+ canvas.style.width=W+"px";canvas.style.height=H+"px";canvas.width=W*DPR;canvas.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+window.addEventListener("resize",()=>{const wasRunning=running;resize();if(bricks&&bricks.length)layoutInfo&&rebuildPositions();});
+resize();
+
+let running=false,score=0,level=1,paddle,boot,particles,bricks,layoutInfo;
+
+// ---- colors per shape ----
+const SHAPE_COLORS={
+  rect:["#e05a5a","#c94848"],
+  diamond:["#5ac8e0","#48a8c9"],
+  triangle:["#9ae05a","#7cc948"],
+  hex:["#e0a55a","#c98848"],
+  circle:["#c95ae0","#a848c9"]
+};
+const SHAPES=["rect","diamond","triangle","hex","circle"];
+
+// ---- brick grid config ----
+function gridConfig(){
+  const cols=7;
+  const margin=14;
+  const gap=6;
+  const cw=(W-margin*2-gap*(cols-1))/cols;
+  const ch=Math.min(26, cw*0.55);
+  const top=70;
+  return {cols,margin,gap,cw,ch,top};
+}
+
+// Procedural "ornament": decide which cells are filled, symmetric pattern.
+function buildLevel(lvl){
+  const g=gridConfig();
+  const rows=Math.min(4+Math.floor(lvl/2),8);
+  bricks=[];
+  layoutInfo={g,rows};
+  const half=Math.ceil(g.cols/2);
+  // generate a symmetric mask
+  const seed=lvl*97+13;
+  function rnd(n){ // deterministic-ish per level+n
+    let x=Math.sin(seed+n*12.9898)*43758.5453; return x-Math.floor(x);
+  }
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<half;c++){
+      const idx=r*half+c;
+      // pattern rules make ornaments: fill based on distance/parity
+      let fill;
+      const patt=lvl%4;
+      if(patt===0) fill = rnd(idx)>0.35;                 // scattered
+      else if(patt===1) fill = ((r+c)%2===0) || rnd(idx)>0.7; // checker + noise
+      else if(patt===2) fill = (c<=r) ;                  // triangle build
+      else fill = (r===0||r===rows-1||c===0) || rnd(idx)>0.6; // frame
+      if(!fill) continue;
+      const shape=SHAPES[(r+c+lvl)%SHAPES.length];
+      const hits=1+ (rnd(idx*3)>0.8 ? 1:0) + Math.floor(lvl/5); // tougher later
+      addBrick(g,r,c,shape,hits);
+      // mirror
+      const mc=g.cols-1-c;
+      if(mc!==c) addBrick(g,r,mc,shape,hits);
+    }
+  }
+}
+
+function addBrick(g,r,c,shape,hits){
+  const x=g.margin + c*(g.cw+g.gap);
+  const y=g.top + r*(g.ch+g.gap);
+  bricks.push({x,y,w:g.cw,h:g.ch,shape,hits,maxHits:hits,alive:true,r,c});
+}
+
+function rebuildPositions(){
+  const g=gridConfig();
+  for(const b of bricks){ b.x=g.margin+b.c*(g.cw+g.gap); b.y=g.top+b.r*(g.ch+g.gap); b.w=g.cw; b.h=g.ch; }
+  layoutInfo.g=g;
+}
+
+function reset(){
+  score=0;level=1;
+  paddle={w:110,h:16,x:W/2-55,y:H-60};
+  spawnBoot();
+  particles=[];
+  buildLevel(level);
+}
+function spawnBoot(keepSpeed){
+  // start speed grows with level, unless we carry over the current speed
+  const base = keepSpeed!=null ? keepSpeed : (3.0 + (level-1)*0.4);
+  boot={x:W/2,y:H-120,r:18,vx:(Math.random()*2-1)*2,vy:-base,speed:base,angle:0,spin:0.05};
+}
+
+function spawnParticles(x,y,color){
+  for(let i=0;i<14;i++)particles.push({x,y,vx:(Math.random()*2-1)*5,vy:(Math.random()*2-1)*5,life:1,color});
+}
+
+function moveTo(clientX){const rect=canvas.getBoundingClientRect();const x=clientX-rect.left;paddle.x=Math.max(0,Math.min(W-paddle.w,x-paddle.w/2));}
+canvas.addEventListener("mousemove",e=>{if(running)moveTo(e.clientX);});
+canvas.addEventListener("touchmove",e=>{if(running&&e.touches[0]){moveTo(e.touches[0].clientX);e.preventDefault();}},{passive:false});
+
+function drawBoot(b){ctx.save();ctx.translate(b.x,b.y);ctx.rotate(b.angle);
+ ctx.fillStyle="#8a5a2b";ctx.strokeStyle="#4a2f16";ctx.lineWidth=2;ctx.beginPath();
+ const s=0.85;
+ ctx.moveTo(-14*s,-20*s);ctx.lineTo(6*s,-20*s);ctx.lineTo(6*s,4*s);ctx.lineTo(20*s,4*s);
+ ctx.quadraticCurveTo(26*s,4*s,26*s,12*s);ctx.lineTo(26*s,18*s);ctx.lineTo(-14*s,18*s);ctx.closePath();ctx.fill();ctx.stroke();
+ ctx.fillStyle="#2c1c0e";ctx.fillRect(-14*s,16*s,42*s,5*s);
+ ctx.fillStyle="#ffd54a";ctx.beginPath();ctx.arc(-4*s,-10*s,2.5,0,7);ctx.fill();ctx.restore();}
+
+function brickColor(b){
+  const cols=SHAPE_COLORS[b.shape];
+  return b.hits>1?cols[0]:cols[1];
+}
+
+function drawBrick(b){
+  if(!b.alive)return;
+  const cx=b.x+b.w/2, cy=b.y+b.h/2;
+  ctx.fillStyle=brickColor(b);
+  ctx.strokeStyle="rgba(0,0,0,.35)";ctx.lineWidth=2;
+  ctx.beginPath();
+  if(b.shape==="rect"){
+    rr(b.x,b.y,b.w,b.h,5);
+  }else if(b.shape==="diamond"){
+    ctx.moveTo(cx,b.y);ctx.lineTo(b.x+b.w,cy);ctx.lineTo(cx,b.y+b.h);ctx.lineTo(b.x,cy);ctx.closePath();
+  }else if(b.shape==="triangle"){
+    ctx.moveTo(cx,b.y);ctx.lineTo(b.x+b.w,b.y+b.h);ctx.lineTo(b.x,b.y+b.h);ctx.closePath();
+  }else if(b.shape==="hex"){
+    const w=b.w,h=b.h,q=w*0.25;
+    ctx.moveTo(b.x+q,b.y);ctx.lineTo(b.x+w-q,b.y);ctx.lineTo(b.x+w,cy);
+    ctx.lineTo(b.x+w-q,b.y+h);ctx.lineTo(b.x+q,b.y+h);ctx.lineTo(b.x,cy);ctx.closePath();
+  }else{ // circle
+    ctx.arc(cx,cy,Math.min(b.w,b.h)/2,0,Math.PI*2);
+  }
+  ctx.fill();ctx.stroke();
+  if(b.hits>1){ // crack hint
+    ctx.strokeStyle="rgba(255,255,255,.5)";ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(cx-4,cy-3);ctx.lineTo(cx+3,cy+2);ctx.lineTo(cx-2,cy+5);ctx.stroke();
+  }
+}
+function rr(x,y,w,h,r){ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);}
+
+function hitBrick(b){
+  b.hits--;
+  spawnParticles(b.x+b.w/2,b.y+b.h/2,brickColor(b));
+  if(b.hits<=0){b.alive=false;score+=10;}
+  else score+=3;
+}
+
+function aliveCount(){return bricks.filter(b=>b.alive).length;}
+
+function nextLevel(keepSpeed){
+  level++;
+  showFlash("Рівень "+level);
+  buildLevel(level);
+  spawnBoot(keepSpeed);
+}
+
+function showFlash(txt){
+  flash.textContent=txt;flash.style.opacity="1";
+  setTimeout(()=>{flash.style.opacity="0";},900);
+}
+
+function step(){
+  if(!running)return;
+  boot.x+=boot.vx;boot.y+=boot.vy;boot.angle+=boot.spin;
+
+  if(boot.x<boot.r){boot.x=boot.r;boot.vx*=-1;}
+  if(boot.x>W-boot.r){boot.x=W-boot.r;boot.vx*=-1;}
+  // top edge: boot flies out and next level starts, speed carried over
+  if(boot.y+boot.r<0){
+    spawnParticles(boot.x,0,"#ffd54a");
+    score+=25; // bonus for escaping through the top
+    nextLevel(boot.speed);
+    render();
+    requestAnimationFrame(step);
+    return;
+  }
+
+  // paddle collision -> speed up on each touch
+  if(boot.vy>0&&boot.y+boot.r>=paddle.y&&boot.y+boot.r<=paddle.y+paddle.h+14&&
+     boot.x>=paddle.x-boot.r&&boot.x<=paddle.x+paddle.w+boot.r){
+    const hit=(boot.x-(paddle.x+paddle.w/2))/(paddle.w/2);
+    boot.speed+=0.25; // gradual increase every paddle touch
+    const ang=hit*1.05;
+    boot.vx=boot.speed*Math.sin(ang)+hit*1.5;
+    boot.vy=-Math.abs(boot.speed*Math.cos(ang));
+    // keep a minimum vertical speed so it never stalls
+    if(Math.abs(boot.vy)<1.5) boot.vy=-1.5;
+    boot.y=paddle.y-boot.r-1;
+    spawnParticles(boot.x,boot.y,"#ffd54a");
+  }
+
+  // brick collision (axis-aligned bounding box test against boot circle bbox)
+  for(const b of bricks){
+    if(!b.alive)continue;
+    if(boot.x+boot.r>b.x && boot.x-boot.r<b.x+b.w &&
+       boot.y+boot.r>b.y && boot.y-boot.r<b.y+b.h){
+      // decide bounce axis by overlap
+      const prevX=boot.x-boot.vx, prevY=boot.y-boot.vy;
+      const fromSide = prevX+boot.r<=b.x || prevX-boot.r>=b.x+b.w;
+      if(fromSide) boot.vx*=-1; else boot.vy*=-1;
+      hitBrick(b);
+      break; // one brick per frame
+    }
+  }
+
+  // level cleared
+  if(aliveCount()===0){
+    nextLevel(boot.speed);
+    render();
+    requestAnimationFrame(step);
+    return;
+  }
+
+  // miss -> game over
+  if(boot.y-boot.r>H){ gameOver(); return; }
+
+  for(const p of particles){p.x+=p.vx;p.y+=p.vy;p.life-=0.04;}
+  particles=particles.filter(p=>p.life>0);
+
+  render();
+  requestAnimationFrame(step);
+}
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  for(const b of bricks) drawBrick(b);
+  ctx.fillStyle="#ffd54a";ctx.beginPath();rr(paddle.x,paddle.y,paddle.w,paddle.h,8);ctx.fill();
+  for(const p of particles){ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.color||"#ffcf5a";ctx.fillRect(p.x,p.y,4,4);}
+  ctx.globalAlpha=1;
+  drawBoot(boot);
+  hud.textContent="Рівень "+level+"   Бали: "+score;
+}
+
+function startGame(){reset();overlay.classList.add("hidden");running=true;requestAnimationFrame(step);}
+async function gameOver(){running=false;
+  overlay.querySelector("h1").textContent="Гру завершено";
+  overlay.querySelectorAll("p").forEach(p=>p.remove());
+  const a=document.createElement("p");a.textContent="Рівень: "+level;
+  const b=document.createElement("p");b.textContent="Бали: "+score;
+  overlay.insertBefore(a,startBtn);overlay.insertBefore(b,startBtn);
+  startBtn.textContent="Ще раз";overlay.classList.remove("hidden");
+  // report score to Telegram via the bot endpoint
+  if(REPORT.ep&&REPORT.uid&&score>0){
+    try{
+      await fetch(REPORT.ep,{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({uid:REPORT.uid,score:score,cid:REPORT.cid,mid:REPORT.mid,iid:REPORT.iid})});
+    }catch(e){}
+  }
+}
+startBtn.addEventListener("click",startGame);
+
+// initial idle render
+paddle={w:110,h:16,x:W/2-55,y:H-60};boot={x:W/2,y:H-120,r:18,vx:0,vy:0,angle:0,spin:0};particles=[];bricks=[];
+render();
+</script>
+</body>
+</html>
