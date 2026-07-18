@@ -59,14 +59,16 @@ window.addEventListener("resize",()=>{const wasRunning=running;resize();if(brick
 resize();
 
 let running=false,score=0,level=1,paddle,boot,particles,bricks,layoutInfo;
+let countdown=0;        // seconds remaining shown before a level starts (0 = playing)
+let countdownUntil=0;   // timestamp when countdown ends
 
 // ---- colors per shape ----
 const SHAPE_COLORS={
-  rect:["#e05a5a","#c94848"],
-  diamond:["#5ac8e0","#48a8c9"],
-  triangle:["#9ae05a","#7cc948"],
-  hex:["#e0a55a","#c98848"],
-  circle:["#c95ae0","#a848c9"]
+  rect:    {base:"#e05a5a", light:"#ff8a8a", dark:"#a83636"},
+  diamond: {base:"#5ac8e0", light:"#8ee6f5", dark:"#3488a0"},
+  triangle:{base:"#9ae05a", light:"#c4f58e", dark:"#6aa838"},
+  hex:     {base:"#e0a55a", light:"#f5cd8e", dark:"#a87538"},
+  circle:  {base:"#c95ae0", light:"#e68ef5", dark:"#8f38a8"}
 };
 const SHAPES=["rect","diamond","triangle","hex","circle"];
 
@@ -128,6 +130,7 @@ function rebuildPositions(){
 
 function reset(){
   score=0;level=1;
+  countdown=0;countdownUntil=0;
   paddle={w:110,h:16,x:W/2-55,y:H-60};
   spawnBoot();
   particles=[];
@@ -147,42 +150,164 @@ function moveTo(clientX){const rect=canvas.getBoundingClientRect();const x=clien
 canvas.addEventListener("mousemove",e=>{if(running)moveTo(e.clientX);});
 canvas.addEventListener("touchmove",e=>{if(running&&e.touches[0]){moveTo(e.touches[0].clientX);e.preventDefault();}},{passive:false});
 
-function drawBoot(b){ctx.save();ctx.translate(b.x,b.y);ctx.rotate(b.angle);
- ctx.fillStyle="#8a5a2b";ctx.strokeStyle="#4a2f16";ctx.lineWidth=2;ctx.beginPath();
- const s=0.85;
- ctx.moveTo(-14*s,-20*s);ctx.lineTo(6*s,-20*s);ctx.lineTo(6*s,4*s);ctx.lineTo(20*s,4*s);
- ctx.quadraticCurveTo(26*s,4*s,26*s,12*s);ctx.lineTo(26*s,18*s);ctx.lineTo(-14*s,18*s);ctx.closePath();ctx.fill();ctx.stroke();
- ctx.fillStyle="#2c1c0e";ctx.fillRect(-14*s,16*s,42*s,5*s);
- ctx.fillStyle="#ffd54a";ctx.beginPath();ctx.arc(-4*s,-10*s,2.5,0,7);ctx.fill();ctx.restore();}
+function drawBoot(b){
+  ctx.save();
+  ctx.translate(b.x,b.y);
+  ctx.rotate(b.angle);
+  const s=0.95;
 
-function brickColor(b){
-  const cols=SHAPE_COLORS[b.shape];
-  return b.hits>1?cols[0]:cols[1];
+  // soft drop shadow
+  ctx.save();
+  ctx.globalAlpha=0.25;
+  ctx.fillStyle="#000";
+  ctx.beginPath();ctx.ellipse(2*s,20*s,20*s,6*s,0,0,7);ctx.fill();
+  ctx.restore();
+
+  // main leather body with vertical gradient
+  const grad=ctx.createLinearGradient(0,-22*s,0,18*s);
+  grad.addColorStop(0,"#b07636");
+  grad.addColorStop(0.5,"#8a5a2b");
+  grad.addColorStop(1,"#5f3c1b");
+  ctx.fillStyle=grad;
+  ctx.strokeStyle="#3d2712";
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  ctx.moveTo(-14*s,-20*s);
+  ctx.lineTo(4*s,-20*s);
+  ctx.quadraticCurveTo(8*s,-20*s,8*s,-14*s);
+  ctx.lineTo(8*s,2*s);
+  ctx.lineTo(20*s,3*s);
+  ctx.quadraticCurveTo(27*s,4*s,27*s,11*s);
+  ctx.lineTo(27*s,15*s);
+  ctx.lineTo(-14*s,15*s);
+  ctx.closePath();
+  ctx.fill();ctx.stroke();
+
+  // toe cap highlight
+  ctx.fillStyle="rgba(255,220,150,.25)";
+  ctx.beginPath();
+  ctx.moveTo(14*s,5*s);ctx.quadraticCurveTo(26*s,5*s,25*s,11*s);
+  ctx.lineTo(16*s,11*s);ctx.closePath();ctx.fill();
+
+  // ankle opening (inner shadow)
+  ctx.fillStyle="#2c1c0e";
+  ctx.beginPath();ctx.ellipse(-4*s,-19*s,9*s,3.2*s,0,0,7);ctx.fill();
+
+  // laces
+  ctx.strokeStyle="#f0e2c0";ctx.lineWidth=1.6*s;
+  for(let i=0;i<4;i++){
+    const ly=-14*s+i*4.2*s;
+    ctx.beginPath();ctx.moveTo(-11*s,ly);ctx.lineTo(5*s,ly-2*s);ctx.stroke();
+  }
+  // lace eyelets
+  ctx.fillStyle="#ffd54a";
+  for(let i=0;i<4;i++){
+    const ly=-14*s+i*4.2*s;
+    ctx.beginPath();ctx.arc(-11*s,ly,1.3*s,0,7);ctx.fill();
+    ctx.beginPath();ctx.arc(5*s,ly-2*s,1.3*s,0,7);ctx.fill();
+  }
+
+  // stitching along the top of the sole
+  ctx.strokeStyle="rgba(255,235,190,.5)";
+  ctx.lineWidth=1;ctx.setLineDash([3*s,2*s]);
+  ctx.beginPath();ctx.moveTo(-13*s,12*s);ctx.lineTo(25*s,12*s);ctx.stroke();
+  ctx.setLineDash([]);
+
+  // sole with tread
+  ctx.fillStyle="#241611";
+  ctx.beginPath();rr(-15*s,14*s,44*s,6*s,2);ctx.fill();
+  // heel
+  ctx.fillStyle="#1a0f0a";
+  ctx.beginPath();rr(-15*s,14*s,8*s,9*s,2);ctx.fill();
+  // tread notches
+  ctx.fillStyle="#3a2418";
+  for(let i=0;i<7;i++){ctx.fillRect((-6+i*5)*s,17*s,2*s,3*s);}
+
+  ctx.restore();
 }
 
-function drawBrick(b){
-  if(!b.alive)return;
+function brickColor(b){
+  return SHAPE_COLORS[b.shape].base;
+}
+
+// build a path for the given brick shape (no fill/stroke here)
+function brickPath(b){
   const cx=b.x+b.w/2, cy=b.y+b.h/2;
-  ctx.fillStyle=brickColor(b);
-  ctx.strokeStyle="rgba(0,0,0,.35)";ctx.lineWidth=2;
   ctx.beginPath();
   if(b.shape==="rect"){
-    rr(b.x,b.y,b.w,b.h,5);
+    rr(b.x,b.y,b.w,b.h,6);
   }else if(b.shape==="diamond"){
     ctx.moveTo(cx,b.y);ctx.lineTo(b.x+b.w,cy);ctx.lineTo(cx,b.y+b.h);ctx.lineTo(b.x,cy);ctx.closePath();
   }else if(b.shape==="triangle"){
-    ctx.moveTo(cx,b.y);ctx.lineTo(b.x+b.w,b.y+b.h);ctx.lineTo(b.x,b.y+b.h);ctx.closePath();
+    ctx.moveTo(cx,b.y+2);ctx.lineTo(b.x+b.w-2,b.y+b.h);ctx.lineTo(b.x+2,b.y+b.h);ctx.closePath();
   }else if(b.shape==="hex"){
     const w=b.w,h=b.h,q=w*0.25;
     ctx.moveTo(b.x+q,b.y);ctx.lineTo(b.x+w-q,b.y);ctx.lineTo(b.x+w,cy);
     ctx.lineTo(b.x+w-q,b.y+h);ctx.lineTo(b.x+q,b.y+h);ctx.lineTo(b.x,cy);ctx.closePath();
   }else{ // circle
-    ctx.arc(cx,cy,Math.min(b.w,b.h)/2,0,Math.PI*2);
+    ctx.arc(cx,cy,Math.min(b.w,b.h)/2-1,0,Math.PI*2);
   }
-  ctx.fill();ctx.stroke();
-  if(b.hits>1){ // crack hint
-    ctx.strokeStyle="rgba(255,255,255,.5)";ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(cx-4,cy-3);ctx.lineTo(cx+3,cy+2);ctx.lineTo(cx-2,cy+5);ctx.stroke();
+}
+
+function drawBrick(b){
+  if(!b.alive)return;
+  const c=SHAPE_COLORS[b.shape];
+  const cx=b.x+b.w/2, cy=b.y+b.h/2;
+
+  // drop shadow
+  ctx.save();
+  ctx.globalAlpha=0.28;
+  ctx.fillStyle="#000";
+  ctx.translate(0,2.5);
+  brickPath(b);ctx.fill();
+  ctx.restore();
+
+  // body gradient (top light -> bottom dark)
+  const g=ctx.createLinearGradient(0,b.y,0,b.y+b.h);
+  g.addColorStop(0,c.light);
+  g.addColorStop(0.5,c.base);
+  g.addColorStop(1,c.dark);
+  ctx.fillStyle=g;
+  brickPath(b);ctx.fill();
+
+  // glossy top-half highlight, clipped to the shape
+  ctx.save();
+  brickPath(b);ctx.clip();
+  const gl=ctx.createLinearGradient(0,b.y,0,cy);
+  gl.addColorStop(0,"rgba(255,255,255,.45)");
+  gl.addColorStop(1,"rgba(255,255,255,0)");
+  ctx.fillStyle=gl;
+  ctx.fillRect(b.x,b.y,b.w,b.h*0.55);
+  ctx.restore();
+
+  // crisp border
+  ctx.lineWidth=1.5;
+  ctx.strokeStyle="rgba(0,0,0,.4)";
+  brickPath(b);ctx.stroke();
+  // inner light edge
+  ctx.lineWidth=1;
+  ctx.strokeStyle="rgba(255,255,255,.25)";
+  ctx.save();brickPath(b);ctx.clip();
+  brickPath(b);ctx.stroke();ctx.restore();
+
+  // durability: tough bricks (>1 hit) get metal rivets in corners
+  if(b.hits>1){
+    ctx.fillStyle="rgba(255,255,255,.55)";
+    const rv=1.7;
+    const pad=5;
+    [[b.x+pad,b.y+pad],[b.x+b.w-pad,b.y+pad],
+     [b.x+pad,b.y+b.h-pad],[b.x+b.w-pad,b.y+b.h-pad]].forEach(p=>{
+      ctx.beginPath();ctx.arc(p[0],p[1],rv,0,7);ctx.fill();
+    });
+  }
+  // already-damaged brick (took a hit but not dead): show a crack
+  if(b.hits>0 && b.hits<b.maxHits){
+    ctx.strokeStyle="rgba(0,0,0,.5)";ctx.lineWidth=1.4;
+    ctx.beginPath();
+    ctx.moveTo(cx-b.w*0.2,b.y+3);
+    ctx.lineTo(cx-2,cy);ctx.lineTo(cx+3,cy+2);
+    ctx.lineTo(cx-b.w*0.1,b.y+b.h-3);
+    ctx.stroke();
   }
 }
 function rr(x,y,w,h,r){ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);}
@@ -198,9 +323,11 @@ function aliveCount(){return bricks.filter(b=>b.alive).length;}
 
 function nextLevel(keepSpeed){
   level++;
-  showFlash("Рівень "+level);
   buildLevel(level);
-  spawnBoot(keepSpeed);
+  // new level starts at 75% of the speed carried from the previous level
+  const carried = keepSpeed!=null ? keepSpeed*0.75 : null;
+  spawnBoot(carried);
+  startCountdown(3); // 3s prep countdown over the new level
 }
 
 function showFlash(txt){
@@ -208,8 +335,28 @@ function showFlash(txt){
   setTimeout(()=>{flash.style.opacity="0";},900);
 }
 
+function startCountdown(sec){
+  countdown=sec;
+  countdownUntil=performance.now()+sec*1000;
+}
+
 function step(){
   if(!running)return;
+
+  // level-start countdown: freeze the boot, let the player get ready
+  if(countdown>0){
+    const remainMs=countdownUntil-performance.now();
+    const shown=Math.max(1,Math.ceil(remainMs/1000));
+    if(remainMs<=0){
+      countdown=0; // go
+    }else{
+      render();
+      drawCountdown(shown);
+      requestAnimationFrame(step);
+      return;
+    }
+  }
+
   boot.x+=boot.vx;boot.y+=boot.vy;boot.angle+=boot.spin;
 
   if(boot.x<boot.r){boot.x=boot.r;boot.vx*=-1;}
@@ -219,7 +366,6 @@ function step(){
     spawnParticles(boot.x,0,"#ffd54a");
     score+=25; // bonus for escaping through the top
     nextLevel(boot.speed);
-    render();
     requestAnimationFrame(step);
     return;
   }
@@ -228,7 +374,7 @@ function step(){
   if(boot.vy>0&&boot.y+boot.r>=paddle.y&&boot.y+boot.r<=paddle.y+paddle.h+14&&
      boot.x>=paddle.x-boot.r&&boot.x<=paddle.x+paddle.w+boot.r){
     const hit=(boot.x-(paddle.x+paddle.w/2))/(paddle.w/2);
-    boot.speed+=0.25; // gradual increase every paddle touch
+    boot.speed+=0.125; // gradual increase every paddle touch (50% slower ramp)
     const ang=hit*1.05;
     boot.vx=boot.speed*Math.sin(ang)+hit*1.5;
     boot.vy=-Math.abs(boot.speed*Math.cos(ang));
@@ -255,7 +401,6 @@ function step(){
   // level cleared
   if(aliveCount()===0){
     nextLevel(boot.speed);
-    render();
     requestAnimationFrame(step);
     return;
   }
@@ -270,10 +415,55 @@ function step(){
   requestAnimationFrame(step);
 }
 
+function drawCountdown(n){
+  // dim veil so bricks stay visible but the number pops
+  ctx.save();
+  ctx.fillStyle="rgba(10,6,22,.45)";
+  ctx.fillRect(0,0,W,H);
+  // pulsing scale within each second
+  const frac=1-((countdownUntil-performance.now())/1000)%1; // 0..1 inside the second
+  const scale=1+0.25*(1-frac);
+  const cx=W/2, cy=H*0.42;
+  ctx.textAlign="center";ctx.textBaseline="middle";
+  ctx.font="700 20px system-ui,sans-serif";
+  ctx.fillStyle="rgba(255,213,74,.85)";
+  ctx.fillText("Приготуйся",cx,cy-70);
+  ctx.save();
+  ctx.translate(cx,cy);ctx.scale(scale,scale);
+  ctx.font="800 96px system-ui,sans-serif";
+  ctx.lineWidth=6;ctx.strokeStyle="rgba(0,0,0,.5)";
+  ctx.strokeText(n,0,0);
+  ctx.fillStyle="#ffd54a";
+  ctx.fillText(n,0,0);
+  ctx.restore();
+  ctx.font="600 16px system-ui,sans-serif";
+  ctx.fillStyle="rgba(255,255,255,.7)";
+  ctx.fillText("Рівень "+level,cx,cy+80);
+  ctx.restore();
+}
+
 function render(){
   ctx.clearRect(0,0,W,H);
   for(const b of bricks) drawBrick(b);
-  ctx.fillStyle="#ffd54a";ctx.beginPath();rr(paddle.x,paddle.y,paddle.w,paddle.h,8);ctx.fill();
+
+  // paddle: shadow + gradient body + top gloss
+  ctx.save();
+  ctx.globalAlpha=0.3;ctx.fillStyle="#000";
+  ctx.beginPath();rr(paddle.x,paddle.y+3,paddle.w,paddle.h,9);ctx.fill();
+  ctx.restore();
+  const pg=ctx.createLinearGradient(0,paddle.y,0,paddle.y+paddle.h);
+  pg.addColorStop(0,"#ffe98a");pg.addColorStop(0.5,"#ffd54a");pg.addColorStop(1,"#d19a1f");
+  ctx.fillStyle=pg;
+  ctx.beginPath();rr(paddle.x,paddle.y,paddle.w,paddle.h,9);ctx.fill();
+  ctx.strokeStyle="rgba(120,80,10,.6)";ctx.lineWidth=1.5;
+  ctx.beginPath();rr(paddle.x,paddle.y,paddle.w,paddle.h,9);ctx.stroke();
+  ctx.fillStyle="rgba(255,255,255,.4)";
+  ctx.beginPath();rr(paddle.x+4,paddle.y+2,paddle.w-8,paddle.h*0.38,5);ctx.fill();
+  // grip marks
+  ctx.strokeStyle="rgba(120,80,10,.4)";ctx.lineWidth=1.5;
+  for(let i=-1;i<=1;i++){const gx=paddle.x+paddle.w/2+i*10;
+    ctx.beginPath();ctx.moveTo(gx,paddle.y+4);ctx.lineTo(gx,paddle.y+paddle.h-4);ctx.stroke();}
+
   for(const p of particles){ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.color||"#ffcf5a";ctx.fillRect(p.x,p.y,4,4);}
   ctx.globalAlpha=1;
   drawBoot(boot);
