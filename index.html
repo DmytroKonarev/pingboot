@@ -31,12 +31,29 @@
   #flash { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
     color:#ffd54a; font-size:34px; font-weight:800; text-shadow:0 3px 8px #000; pointer-events:none;
     opacity:0; transition:opacity .25s; }
+  #pauseBtn { position:fixed; top:8px; right:10px; z-index:5; width:40px; height:40px;
+    border:none; border-radius:10px; background:rgba(0,0,0,.35); color:#ffd54a;
+    font-size:18px; font-weight:800; cursor:pointer; display:none; align-items:center; justify-content:center; }
+  #pauseBtn.show { display:flex; }
+  #pauseOverlay { position:fixed; inset:0; z-index:6; display:none; flex-direction:column;
+    align-items:center; justify-content:center; background:rgba(15,10,32,.8); color:#fff; text-align:center; }
+  #pauseOverlay.show { display:flex; }
+  #pauseOverlay h1 { color:#ffd54a; font-size:30px; margin:0 0 4px; }
+  #pauseOverlay p { opacity:.8; margin:4px 0 0; font-size:14px; }
+  #pauseOverlay button { margin-top:20px; padding:14px 34px; font-size:20px; font-weight:700;
+    border:none; border-radius:12px; background:#ffd54a; color:#2a1c4a; cursor:pointer; }
 </style>
 </head>
 <body>
 <div id="wrap"><canvas id="c"></canvas></div>
 <div id="hud"></div>
 <div id="flash"></div>
+<button id="pauseBtn" aria-label="Пауза">II</button>
+<div id="pauseOverlay">
+  <h1>Пауза</h1>
+  <p>Гру призупинено</p>
+  <button id="resumeBtn">Продовжити</button>
+</div>
 <div id="overlay">
   <h1>Ping Boot</h1>
   <p>Розбий усі блоки ботинком.</p>
@@ -51,6 +68,7 @@ const P=new URLSearchParams(location.search);
 const REPORT={uid:P.get("uid"),name:P.get("name"),cid:P.get("cid"),mid:P.get("mid"),iid:P.get("iid"),ep:P.get("ep"),top:P.get("top")};
 const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
 const hud=document.getElementById("hud"),overlay=document.getElementById("overlay"),startBtn=document.getElementById("startBtn"),flash=document.getElementById("flash");
+const pauseBtn=document.getElementById("pauseBtn"),pauseOverlay=document.getElementById("pauseOverlay"),resumeBtn=document.getElementById("resumeBtn");
 
 let W=0,H=0,DPR=1;
 function resize(){DPR=Math.min(window.devicePixelRatio||1,2);W=Math.min(window.innerWidth,520);H=window.innerHeight;
@@ -59,8 +77,35 @@ window.addEventListener("resize",()=>{const wasRunning=running;resize();if(brick
 resize();
 
 let running=false,score=0,level=1,paddle,boot,particles,bricks,layoutInfo;
+let paused=false;       // true while the game is paused
+let pauseRemain=null;   // {wide, slow, countdown} ms remaining, captured at pause
 let countdown=0;        // seconds remaining shown before a level starts (0 = playing)
 let countdownUntil=0;   // timestamp when countdown ends
+
+// multi-boot support: `boots` is the source of truth; `boot` mirrors the first
+// active boot only for legacy references that still read a single boot.
+let boots=[];
+
+// falling power-ups the player can catch with the paddle
+let powerups=[];
+let dropsThisLevel=0;      // how many power-ups already dropped this level
+let dropQuota=0;           // how many are PLANNED to drop this level (random 0..2)
+let dropThresholds=[];     // progress points (0..1) at which planned drops trigger
+let bricksAtLevelStart=0;  // to schedule drops across the level
+
+// timed effects
+let paddleBaseW=110;       // normal paddle width
+let widePaddleUntil=0;     // timestamp; while > now, paddle is widened
+let slowUntil=0;           // timestamp; while > now, time is slowed
+const SLOW_FACTOR=0.5;     // boots move at 50% speed during slow-mo
+
+// power-up types
+const POW_TYPES=["multiball","widepaddle","slowmo"];
+const POW_STYLE={
+  multiball:  {color:"#ffd54a", ring:"#a8791f", label:"+1"},
+  widepaddle: {color:"#5ad1ff", ring:"#2f7fa0", label:"W"},
+  slowmo:     {color:"#b58cff", ring:"#6a4fb0", label:"S"}
+};
 
 // ---- colors per shape ----
 const SHAPE_COLORS={
@@ -131,15 +176,25 @@ function rebuildPositions(){
 function reset(){
   score=0;level=1;
   countdown=0;countdownUntil=0;
-  paddle={w:110,h:16,x:W/2-55,y:H-60};
+  paddleBaseW=110;
+  widePaddleUntil=0;slowUntil=0;
+  paddle={w:paddleBaseW,h:16,x:W/2-paddleBaseW/2,y:H-60};
+  boots=[];powerups=[];dropsThisLevel=0;
   spawnBoot();
   particles=[];
   buildLevel(level);
+  bricksAtLevelStart=aliveCount();
+  planLevelDrops();
 }
+function makeBoot(speed,x,y){
+  const sp = speed!=null ? speed : (3.0 + (level-1)*0.4);
+  return {x:(x!=null?x:W/2), y:(y!=null?y:H-120), r:18,
+    vx:(Math.random()*2-1)*2, vy:-sp, speed:sp, angle:0, spin:0.05};
+}
+// spawn a fresh single boot (used at level start). keepSpeed carries momentum.
 function spawnBoot(keepSpeed){
-  // start speed grows with level, unless we carry over the current speed
-  const base = keepSpeed!=null ? keepSpeed : (3.0 + (level-1)*0.4);
-  boot={x:W/2,y:H-120,r:18,vx:(Math.random()*2-1)*2,vy:-base,speed:base,angle:0,spin:0.05};
+  boots=[makeBoot(keepSpeed)];
+  boot=boots[0];
 }
 
 function spawnParticles(x,y,color){
@@ -147,8 +202,8 @@ function spawnParticles(x,y,color){
 }
 
 function moveTo(clientX){const rect=canvas.getBoundingClientRect();const x=clientX-rect.left;paddle.x=Math.max(0,Math.min(W-paddle.w,x-paddle.w/2));}
-canvas.addEventListener("mousemove",e=>{if(running)moveTo(e.clientX);});
-canvas.addEventListener("touchmove",e=>{if(running&&e.touches[0]){moveTo(e.touches[0].clientX);e.preventDefault();}},{passive:false});
+canvas.addEventListener("mousemove",e=>{if(running&&!paused)moveTo(e.clientX);});
+canvas.addEventListener("touchmove",e=>{if(running&&!paused&&e.touches[0]){moveTo(e.touches[0].clientX);e.preventDefault();}},{passive:false});
 
 function drawBoot(b){
   ctx.save();
@@ -315,8 +370,135 @@ function rr(x,y,w,h,r){ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+
 function hitBrick(b){
   b.hits--;
   spawnParticles(b.x+b.w/2,b.y+b.h/2,brickColor(b));
-  if(b.hits<=0){b.alive=false;score+=10;}
-  else score+=3;
+  if(b.hits<=0){
+    b.alive=false;score+=10;
+    maybeDropPowerup(b.x+b.w/2, b.y+b.h/2);
+  } else {
+    score+=3;
+  }
+}
+
+// At the start of each level, randomly decide how many power-ups this level
+// will yield (0, 1 or 2) and at what progress points they trigger.
+// From level 2 only. Distribution is weighted so 0/1/2 all happen.
+function planLevelDrops(){
+  dropsThisLevel=0;
+  dropThresholds=[];
+  dropQuota=0;
+  if(level<2) return;
+  // roll the count: ~30% none, ~45% one, ~25% two
+  const r=Math.random();
+  if(r<0.30) dropQuota=0;
+  else if(r<0.75) dropQuota=1;
+  else dropQuota=2;
+  // pick random progress points for each planned drop, kept apart a bit
+  for(let i=0;i<dropQuota;i++){
+    // spread across the level: 0.2..0.85, with some randomness
+    const base = dropQuota===2 ? (i===0?0.25:0.65) : 0.4;
+    const jitter = (Math.random()*2-1)*0.15;
+    dropThresholds.push(Math.min(0.9, Math.max(0.1, base+jitter)));
+  }
+  dropThresholds.sort((a,b)=>a-b);
+}
+
+// Called when a brick is destroyed. Releases a planned drop once the level
+// progress crosses the next scheduled threshold.
+function maybeDropPowerup(x,y){
+  if(dropsThisLevel>=dropQuota) return;
+  const destroyed = bricksAtLevelStart - aliveCount();
+  const total = Math.max(1,bricksAtLevelStart);
+  const progress = destroyed/total;
+  const nextThreshold = dropThresholds[dropsThisLevel];
+  if(nextThreshold!=null && progress>=nextThreshold){
+    spawnPowerup(x,y);
+  }
+}
+
+function spawnPowerup(x,y){
+  if(dropsThisLevel>=dropQuota) return;
+  dropsThisLevel++;
+  const type=POW_TYPES[Math.floor(Math.random()*POW_TYPES.length)];
+  // movement style: some fall straight, some drift/zigzag unpredictably
+  const wobble = Math.random()<0.5;
+  powerups.push({
+    x, y, r:13, type,
+    vy: 2.2 + Math.random()*0.6,
+    vx: wobble ? (Math.random()*2-1)*1.5 : 0,
+    wobble,
+    phase: Math.random()*Math.PI*2,
+    spin: 0
+  });
+}
+
+function applyPowerup(type){
+  const now=performance.now();
+  if(type==="multiball"){
+    // add a boot cloned from the fastest active boot, sent upward
+    const src = boots.length ? boots.reduce((a,b)=>a.speed>b.speed?a:b) : null;
+    const sp = src ? src.speed : (3.0+(level-1)*0.4);
+    const nb = makeBoot(sp, paddle.x+paddle.w/2, paddle.y-30);
+    nb.vy = -Math.abs(sp);
+    nb.vx = (Math.random()*2-1)*2;
+    boots.push(nb);
+  } else if(type==="widepaddle"){
+    widePaddleUntil = now + 10000; // 10 seconds
+  } else if(type==="slowmo"){
+    slowUntil = now + 10000; // 10 seconds
+  }
+  // catch sparkle
+  const st=POW_STYLE[type];
+  for(let i=0;i<18;i++)particles.push({x:paddle.x+paddle.w/2,y:paddle.y,
+    vx:(Math.random()*2-1)*5,vy:(Math.random()*2-1)*5,life:1,color:st.color});
+}
+
+// advance and collide power-ups; returns nothing, mutates powerups
+function updatePowerups(dt){
+  for(const p of powerups){
+    p.phase += 0.12;
+    if(p.wobble){
+      // unpredictable side-to-side drift
+      p.x += p.vx + Math.sin(p.phase)*1.6;
+      // occasionally flip drift direction
+      if(Math.random()<0.02) p.vx*=-1;
+    } else {
+      p.x += p.vx;
+    }
+    p.y += p.vy;
+    p.spin += 0.08;
+    // bounce off side walls softly
+    if(p.x<p.r){p.x=p.r;p.vx=Math.abs(p.vx);}
+    if(p.x>W-p.r){p.x=W-p.r;p.vx=-Math.abs(p.vx);}
+    // caught by paddle?
+    if(p.y+p.r>=paddle.y && p.y-p.r<=paddle.y+paddle.h &&
+       p.x>=paddle.x-p.r && p.x<=paddle.x+paddle.w+p.r){
+      p.caught=true;
+      applyPowerup(p.type);
+    }
+  }
+  // keep only those still on screen and not caught
+  powerups = powerups.filter(p=>!p.caught && p.y-p.r<=H);
+}
+
+function drawPowerup(p){
+  const st=POW_STYLE[p.type];
+  ctx.save();
+  ctx.translate(p.x,p.y);
+  // glow
+  ctx.globalAlpha=0.35;
+  ctx.fillStyle=st.color;
+  ctx.beginPath();ctx.arc(0,0,p.r+5,0,7);ctx.fill();
+  ctx.globalAlpha=1;
+  // capsule body
+  ctx.rotate(Math.sin(p.spin)*0.15);
+  const g=ctx.createLinearGradient(0,-p.r,0,p.r);
+  g.addColorStop(0,"#ffffff");g.addColorStop(0.35,st.color);g.addColorStop(1,st.ring);
+  ctx.fillStyle=g;ctx.strokeStyle=st.ring;ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(0,0,p.r,0,7);ctx.fill();ctx.stroke();
+  // label
+  ctx.fillStyle="#20143a";ctx.font="700 12px system-ui,sans-serif";
+  ctx.textAlign="center";ctx.textBaseline="middle";
+  ctx.fillText(st.label,0,1);
+  ctx.restore();
 }
 
 function aliveCount(){return bricks.filter(b=>b.alive).length;}
@@ -324,6 +506,12 @@ function aliveCount(){return bricks.filter(b=>b.alive).length;}
 function nextLevel(keepSpeed){
   level++;
   buildLevel(level);
+  bricksAtLevelStart=aliveCount();
+  dropsThisLevel=0;
+  planLevelDrops();
+  powerups=[];               // clear uncaught drops
+  widePaddleUntil=0;slowUntil=0; // effects don't carry across levels
+  paddle.w=paddleBaseW;paddle.x=Math.max(0,Math.min(W-paddle.w,paddle.x));
   // new level starts at 75% of the speed carried from the previous level
   const carried = keepSpeed!=null ? keepSpeed*0.75 : null;
   spawnBoot(carried);
@@ -342,10 +530,12 @@ function startCountdown(sec){
 
 function step(){
   if(!running)return;
+  if(paused){ render(); drawPauseHint(); return; } // frozen; loop resumes on resumeGame()
+  const now=performance.now();
 
-  // level-start countdown: freeze the boot, let the player get ready
+  // level-start countdown: freeze play, let the player get ready
   if(countdown>0){
-    const remainMs=countdownUntil-performance.now();
+    const remainMs=countdownUntil-now;
     const shown=Math.max(1,Math.ceil(remainMs/1000));
     if(remainMs<=0){
       countdown=0; // go
@@ -357,57 +547,80 @@ function step(){
     }
   }
 
-  boot.x+=boot.vx;boot.y+=boot.vy;boot.angle+=boot.spin;
-
-  if(boot.x<boot.r){boot.x=boot.r;boot.vx*=-1;}
-  if(boot.x>W-boot.r){boot.x=W-boot.r;boot.vx*=-1;}
-  // top edge: boot flies out and next level starts, speed carried over
-  if(boot.y+boot.r<0){
-    spawnParticles(boot.x,0,"#ffd54a");
-    score+=25; // bonus for escaping through the top
-    nextLevel(boot.speed);
-    requestAnimationFrame(step);
-    return;
+  // timed paddle width
+  const wide = now < widePaddleUntil;
+  const targetW = wide ? paddleBaseW*1.25 : paddleBaseW;
+  if(paddle.w!==targetW){
+    const cx=paddle.x+paddle.w/2;
+    paddle.w=targetW;
+    paddle.x=Math.max(0,Math.min(W-paddle.w,cx-paddle.w/2));
   }
 
-  // paddle collision -> speed up on each touch
-  if(boot.vy>0&&boot.y+boot.r>=paddle.y&&boot.y+boot.r<=paddle.y+paddle.h+14&&
-     boot.x>=paddle.x-boot.r&&boot.x<=paddle.x+paddle.w+boot.r){
-    const hit=(boot.x-(paddle.x+paddle.w/2))/(paddle.w/2);
-    boot.speed+=0.125; // gradual increase every paddle touch (50% slower ramp)
-    const ang=hit*1.05;
-    boot.vx=boot.speed*Math.sin(ang)+hit*1.5;
-    boot.vy=-Math.abs(boot.speed*Math.cos(ang));
-    // keep a minimum vertical speed so it never stalls
-    if(Math.abs(boot.vy)<1.5) boot.vy=-1.5;
-    boot.y=paddle.y-boot.r-1;
-    spawnParticles(boot.x,boot.y,"#ffd54a");
-  }
+  // time scale (slow-mo affects boot movement only)
+  const scale = (now < slowUntil) ? SLOW_FACTOR : 1;
 
-  // brick collision (axis-aligned bounding box test against boot circle bbox)
-  for(const b of bricks){
-    if(!b.alive)continue;
-    if(boot.x+boot.r>b.x && boot.x-boot.r<b.x+b.w &&
-       boot.y+boot.r>b.y && boot.y-boot.r<b.y+b.h){
-      // decide bounce axis by overlap
-      const prevX=boot.x-boot.vx, prevY=boot.y-boot.vy;
-      const fromSide = prevX+boot.r<=b.x || prevX-boot.r>=b.x+b.w;
-      if(fromSide) boot.vx*=-1; else boot.vy*=-1;
-      hitBrick(b);
-      break; // one brick per frame
+  // ---- move & collide every active boot ----
+  for(const bt of boots){
+    bt.x+=bt.vx*scale; bt.y+=bt.vy*scale; bt.angle+=bt.spin*scale;
+
+    if(bt.x<bt.r){bt.x=bt.r;bt.vx*=-1;}
+    if(bt.x>W-bt.r){bt.x=W-bt.r;bt.vx*=-1;}
+
+    // top edge: this boot exits -> level up (carry this boot's speed)
+    if(bt.y+bt.r<0){
+      spawnParticles(bt.x,0,"#ffd54a");
+      score+=25;
+      nextLevel(bt.speed);
+      requestAnimationFrame(step);
+      return;
+    }
+
+    // paddle collision
+    if(bt.vy>0 && bt.y+bt.r>=paddle.y && bt.y+bt.r<=paddle.y+paddle.h+14 &&
+       bt.x>=paddle.x-bt.r && bt.x<=paddle.x+paddle.w+bt.r){
+      const hit=(bt.x-(paddle.x+paddle.w/2))/(paddle.w/2);
+      bt.speed+=0.125;
+      const ang=hit*1.05;
+      bt.vx=bt.speed*Math.sin(ang)+hit*1.5;
+      bt.vy=-Math.abs(bt.speed*Math.cos(ang));
+      if(Math.abs(bt.vy)<1.5) bt.vy=-1.5;
+      bt.y=paddle.y-bt.r-1;
+      spawnParticles(bt.x,bt.y,"#ffd54a");
+    }
+
+    // brick collision (one brick per boot per frame)
+    for(const b of bricks){
+      if(!b.alive)continue;
+      if(bt.x+bt.r>b.x && bt.x-bt.r<b.x+b.w &&
+         bt.y+bt.r>b.y && bt.y-bt.r<b.y+b.h){
+        const prevX=bt.x-bt.vx;
+        const fromSide = prevX+bt.r<=b.x || prevX-bt.r>=b.x+b.w;
+        if(fromSide) bt.vx*=-1; else bt.vy*=-1;
+        hitBrick(b);
+        break;
+      }
     }
   }
 
-  // level cleared
+  // remove boots that fell below the screen
+  boots = boots.filter(bt=>bt.y-bt.r<=H);
+  boot = boots[0] || boot; // keep legacy mirror pointing at an active boot
+
+  // all boots lost -> game over
+  if(boots.length===0){ gameOver(); return; }
+
+  // level cleared -> next level (carry fastest boot's speed)
   if(aliveCount()===0){
-    nextLevel(boot.speed);
+    const fastest=boots.reduce((a,b)=>a.speed>b.speed?a:b);
+    nextLevel(fastest.speed);
     requestAnimationFrame(step);
     return;
   }
 
-  // miss -> game over
-  if(boot.y-boot.r>H){ gameOver(); return; }
+  // power-ups fall & get caught
+  updatePowerups();
 
+  // particles
   for(const p of particles){p.x+=p.vx;p.y+=p.vy;p.life-=0.04;}
   particles=particles.filter(p=>p.life>0);
 
@@ -442,6 +655,14 @@ function drawCountdown(n){
   ctx.restore();
 }
 
+function drawPauseHint(){
+  // subtle veil on the canvas; the HTML pause overlay sits on top
+  ctx.save();
+  ctx.fillStyle="rgba(10,6,22,.35)";
+  ctx.fillRect(0,0,W,H);
+  ctx.restore();
+}
+
 function render(){
   ctx.clearRect(0,0,W,H);
   for(const b of bricks) drawBrick(b);
@@ -466,12 +687,80 @@ function render(){
 
   for(const p of particles){ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.color||"#ffcf5a";ctx.fillRect(p.x,p.y,4,4);}
   ctx.globalAlpha=1;
-  drawBoot(boot);
+
+  // falling power-ups
+  for(const p of powerups) drawPowerup(p);
+
+  // all active boots
+  for(const bt of boots) drawBoot(bt);
+
+  // active-effect indicators (top-right)
+  const now=performance.now();
+  const badges=[];
+  if(now<widePaddleUntil) badges.push({t:"Широка ракетка", ms:widePaddleUntil-now, c:"#5ad1ff"});
+  if(now<slowUntil) badges.push({t:"Уповільнення", ms:slowUntil-now, c:"#b58cff"});
+  if(boots.length>1) badges.push({t:"Ботинки: "+boots.length, ms:null, c:"#ffd54a"});
+  ctx.textAlign="right";ctx.textBaseline="top";ctx.font="600 13px system-ui,sans-serif";
+  badges.forEach((bd,i)=>{
+    const secs = bd.ms!=null ? " "+Math.ceil(bd.ms/1000)+"с" : "";
+    ctx.fillStyle=bd.c;
+    ctx.fillText(bd.t+secs, W-10, 40+i*18);
+  });
+
   hud.textContent="Рівень "+level+"   Бали: "+score;
 }
 
-function startGame(){reset();overlay.classList.add("hidden");running=true;requestAnimationFrame(step);}
+function startGame(){
+  reset();
+  overlay.classList.add("hidden");
+  pauseOverlay.classList.remove("show");
+  pauseBtn.classList.add("show");
+  paused=false;pauseRemain=null;
+  running=true;
+  requestAnimationFrame(step);
+}
+
+function pauseGame(){
+  if(!running || paused) return;
+  paused=true;
+  const now=performance.now();
+  // freeze timed effects by remembering how much time was left
+  pauseRemain={
+    wide: widePaddleUntil>now ? widePaddleUntil-now : 0,
+    slow: slowUntil>now ? slowUntil-now : 0,
+    countdown: (countdown>0 && countdownUntil>now) ? countdownUntil-now : 0
+  };
+  pauseOverlay.classList.add("show");
+}
+
+function resumeGame(){
+  if(!running || !paused) return;
+  const now=performance.now();
+  // restore timed effects relative to the new clock
+  if(pauseRemain){
+    widePaddleUntil = pauseRemain.wide>0 ? now+pauseRemain.wide : 0;
+    slowUntil       = pauseRemain.slow>0 ? now+pauseRemain.slow : 0;
+    if(pauseRemain.countdown>0){ countdownUntil = now+pauseRemain.countdown; }
+  }
+  pauseRemain=null;
+  paused=false;
+  pauseOverlay.classList.remove("show");
+  requestAnimationFrame(step);
+}
+
+function togglePause(){ paused?resumeGame():pauseGame(); }
+
+pauseBtn.addEventListener("click",togglePause);
+resumeBtn.addEventListener("click",resumeGame);
+window.addEventListener("keydown",e=>{
+  if((e.key==="p"||e.key==="P"||e.key==="Escape"||e.key===" ") && running){
+    e.preventDefault();togglePause();
+  }
+});
 async function gameOver(){running=false;
+  paused=false;pauseRemain=null;
+  pauseBtn.classList.remove("show");
+  pauseOverlay.classList.remove("show");
   overlay.querySelector("h1").textContent="Гру завершено";
   overlay.querySelectorAll("p").forEach(p=>p.remove());
   const old=document.getElementById("board");if(old)old.remove();
@@ -517,7 +806,9 @@ async function gameOver(){running=false;
 startBtn.addEventListener("click",startGame);
 
 // initial idle render
-paddle={w:110,h:16,x:W/2-55,y:H-60};boot={x:W/2,y:H-120,r:18,vx:0,vy:0,angle:0,spin:0};particles=[];bricks=[];
+paddle={w:paddleBaseW,h:16,x:W/2-paddleBaseW/2,y:H-60};
+boot={x:W/2,y:H-120,r:18,vx:0,vy:0,angle:0,spin:0};
+boots=[boot];particles=[];bricks=[];powerups=[];
 render();
 </script>
 </body>
