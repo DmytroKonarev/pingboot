@@ -70,6 +70,58 @@ const canvas=document.getElementById("c"),ctx=canvas.getContext("2d");
 const hud=document.getElementById("hud"),overlay=document.getElementById("overlay"),startBtn=document.getElementById("startBtn"),flash=document.getElementById("flash");
 const pauseBtn=document.getElementById("pauseBtn"),pauseOverlay=document.getElementById("pauseOverlay"),resumeBtn=document.getElementById("resumeBtn");
 
+// ---------- retro sound engine (8-bit style, synthesized, no files) ----------
+let audioCtx=null;
+function initAudio(){
+  if(audioCtx) return;
+  try{
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+  }catch(e){ audioCtx=null; }
+}
+// resume on first user gesture (browsers block audio before that)
+function unlockAudio(){
+  initAudio();
+  if(audioCtx && audioCtx.state==="suspended") audioCtx.resume();
+}
+// play a short retro blip: freq in Hz, type of wave, duration seconds
+function blip(freq, type="square", dur=0.08, vol=0.18, slideTo=null){
+  if(!audioCtx) return;
+  const t=audioCtx.currentTime;
+  const osc=audioCtx.createOscillator();
+  const gain=audioCtx.createGain();
+  osc.type=type;
+  osc.frequency.setValueAtTime(freq, t);
+  if(slideTo!=null) osc.frequency.exponentialRampToValueAtTime(Math.max(40,slideTo), t+dur);
+  // NES-ish envelope: quick attack, fast decay
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(vol, t+0.005);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t);
+  osc.stop(t+dur+0.02);
+}
+// each brick shape has its own distinct break sound
+const BRICK_SOUND={
+  rect:    ()=>blip(330,"square",0.07,0.18, 220),   // low square thunk
+  diamond: ()=>blip(660,"triangle",0.08,0.16, 990), // bright rising ping
+  triangle:()=>blip(520,"sawtooth",0.06,0.14, 400), // buzzy zap
+  hex:     ()=>blip(440,"square",0.09,0.17, 300),   // mid tone
+  circle:  ()=>blip(784,"sine",0.10,0.15, 1200)     // clean high bloop
+};
+function playBrickSound(shape){ (BRICK_SOUND[shape]||BRICK_SOUND.rect)(); }
+function playPaddleSound(){ blip(180,"square",0.05,0.14, 260); } // short pong
+function playPowerupSound(){ blip(523,"square",0.12,0.16, 1046); } // pickup arpeggio-ish
+function playLevelSound(){ blip(392,"square",0.12,0.16, 784); }
+
+// ---------- haptics ----------
+function vibrate(ms){
+  try{ if(navigator.vibrate) navigator.vibrate(ms); }catch(e){}
+}
+// unlock audio on the very first interaction anywhere, just in case
+window.addEventListener("pointerdown",unlockAudio,{once:true});
+window.addEventListener("touchstart",unlockAudio,{once:true});
+
+
 let W=0,H=0,DPR=1;
 function resize(){DPR=Math.min(window.devicePixelRatio||1,2);W=Math.min(window.innerWidth,520);H=window.innerHeight;
  canvas.style.width=W+"px";canvas.style.height=H+"px";canvas.width=W*DPR;canvas.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
@@ -98,6 +150,15 @@ let paddleBaseW=110;       // normal paddle width
 let widePaddleUntil=0;     // timestamp; while > now, paddle is widened
 let slowUntil=0;           // timestamp; while > now, time is slowed
 const SLOW_FACTOR=0.5;     // boots move at 50% speed during slow-mo
+
+// ---- physics tuning (kept conservative so the game stays controllable) ----
+const PADDLE_TRANSFER = 0.35;  // how much of the paddle's horizontal speed passes to the boot
+const SPIN_FROM_PADDLE = 0.018;// paddle motion -> spin (per unit of paddle vx)
+const SPIN_FROM_HIT   = 0.9;   // off-center hit -> spin (per unit of hit offset -1..1)
+const MAGNUS_K        = 0.012; // spin -> sideways curve force per frame
+const SPIN_DECAY      = 0.985; // spin fades each frame (air resistance)
+const MAX_SPIN        = 6;     // clamp so curves never get silly
+const MAX_VX_RATIO    = 2.2;   // cap horizontal speed relative to boot.speed
 
 // power-up types
 const POW_TYPES=["multiball","widepaddle","slowmo"];
@@ -178,7 +239,7 @@ function reset(){
   countdown=0;countdownUntil=0;
   paddleBaseW=110;
   widePaddleUntil=0;slowUntil=0;
-  paddle={w:paddleBaseW,h:16,x:W/2-paddleBaseW/2,y:H-60};
+  paddle={w:paddleBaseW,h:16,x:W/2-paddleBaseW/2,y:H-60,vx:0,prevX:W/2-paddleBaseW/2};
   boots=[];powerups=[];dropsThisLevel=0;
   spawnBoot();
   particles=[];
@@ -189,7 +250,9 @@ function reset(){
 function makeBoot(speed,x,y){
   const sp = speed!=null ? speed : (3.0 + (level-1)*0.4);
   return {x:(x!=null?x:W/2), y:(y!=null?y:H-120), r:18,
-    vx:(Math.random()*2-1)*2, vy:-sp, speed:sp, angle:0, spin:0.05};
+    vx:(Math.random()*2-1)*2, vy:-sp, speed:sp,
+    angle:0,          // visual rotation of the sprite
+    spinVel:0};       // physical spin: curves the flight path (Magnus)
 }
 // spawn a fresh single boot (used at level start). keepSpeed carries momentum.
 function spawnBoot(keepSpeed){
@@ -372,9 +435,11 @@ function hitBrick(b){
   spawnParticles(b.x+b.w/2,b.y+b.h/2,brickColor(b));
   if(b.hits<=0){
     b.alive=false;score+=10;
+    playBrickSound(b.shape);           // distinct break sound per shape
     maybeDropPowerup(b.x+b.w/2, b.y+b.h/2);
   } else {
     score+=3;
+    blip(240,"square",0.03,0.10,240);  // soft tick when a tough brick is chipped
   }
 }
 
@@ -449,6 +514,8 @@ function applyPowerup(type){
   const st=POW_STYLE[type];
   for(let i=0;i<18;i++)particles.push({x:paddle.x+paddle.w/2,y:paddle.y,
     vx:(Math.random()*2-1)*5,vy:(Math.random()*2-1)*5,life:1,color:st.color});
+  playPowerupSound();
+  vibrate([10,30,10]); // little double buzz on pickup
 }
 
 // advance and collide power-ups; returns nothing, mutates powerups
@@ -526,6 +593,7 @@ function showFlash(txt){
 function startCountdown(sec){
   countdown=sec;
   countdownUntil=performance.now()+sec*1000;
+  playLevelSound();
 }
 
 function step(){
@@ -559,12 +627,28 @@ function step(){
   // time scale (slow-mo affects boot movement only)
   const scale = (now < slowUntil) ? SLOW_FACTOR : 1;
 
+  // paddle horizontal velocity (how fast the player is sweeping it this frame)
+  paddle.vx = paddle.x - paddle.prevX;
+  paddle.prevX = paddle.x;
+
   // ---- move & collide every active boot ----
   for(const bt of boots){
-    bt.x+=bt.vx*scale; bt.y+=bt.vy*scale; bt.angle+=bt.spin*scale;
+    // Magnus effect: spin curves the horizontal velocity mid-flight
+    bt.vx += bt.spinVel * MAGNUS_K * scale;
+    // clamp horizontal speed so curves stay playable
+    const vxCap = bt.speed * MAX_VX_RATIO;
+    if(bt.vx> vxCap) bt.vx= vxCap;
+    if(bt.vx<-vxCap) bt.vx=-vxCap;
+    // spin fades over time (air resistance)
+    bt.spinVel *= SPIN_DECAY;
+    if(Math.abs(bt.spinVel)<0.001) bt.spinVel=0;
 
-    if(bt.x<bt.r){bt.x=bt.r;bt.vx*=-1;}
-    if(bt.x>W-bt.r){bt.x=W-bt.r;bt.vx*=-1;}
+    // move; visual rotation reflects spin + travel direction
+    bt.x+=bt.vx*scale; bt.y+=bt.vy*scale;
+    bt.angle += (bt.spinVel*0.05 + bt.vx*0.01) * scale;
+
+    if(bt.x<bt.r){bt.x=bt.r;bt.vx*=-1;bt.spinVel*=-0.5;}
+    if(bt.x>W-bt.r){bt.x=W-bt.r;bt.vx*=-1;bt.spinVel*=-0.5;}
 
     // top edge: this boot exits -> level up (carry this boot's speed)
     if(bt.y+bt.r<0){
@@ -578,14 +662,31 @@ function step(){
     // paddle collision
     if(bt.vy>0 && bt.y+bt.r>=paddle.y && bt.y+bt.r<=paddle.y+paddle.h+14 &&
        bt.x>=paddle.x-bt.r && bt.x<=paddle.x+paddle.w+bt.r){
-      const hit=(bt.x-(paddle.x+paddle.w/2))/(paddle.w/2);
-      bt.speed+=0.125;
+      const hit=(bt.x-(paddle.x+paddle.w/2))/(paddle.w/2); // -1..1 across paddle
+      bt.speed+=0.125; // gradual speed ramp per touch
+
+      // base reflection angle from where it struck the paddle
       const ang=hit*1.05;
-      bt.vx=bt.speed*Math.sin(ang)+hit*1.5;
-      bt.vy=-Math.abs(bt.speed*Math.cos(ang));
-      if(Math.abs(bt.vy)<1.5) bt.vy=-1.5;
+      let vx = bt.speed*Math.sin(ang) + hit*1.5;
+      const vy = -Math.abs(bt.speed*Math.cos(ang));
+
+      // 1) velocity transfer: a moving paddle "carries" the boot sideways
+      vx += paddle.vx * PADDLE_TRANSFER;
+
+      // 2) spin is generated from paddle sweep and off-center contact
+      bt.spinVel += paddle.vx * SPIN_FROM_PADDLE + hit * SPIN_FROM_HIT;
+      if(bt.spinVel> MAX_SPIN) bt.spinVel= MAX_SPIN;
+      if(bt.spinVel<-MAX_SPIN) bt.spinVel=-MAX_SPIN;
+
+      // clamp horizontal speed so a fast sweep can't fire it sideways
+      const vxCap = bt.speed * MAX_VX_RATIO;
+      bt.vx = Math.max(-vxCap, Math.min(vxCap, vx));
+      bt.vy = vy;
+      if(Math.abs(bt.vy)<1.5) bt.vy=-1.5; // always keep climbing
       bt.y=paddle.y-bt.r-1;
       spawnParticles(bt.x,bt.y,"#ffd54a");
+      playPaddleSound();
+      vibrate(15); // light tap on bounce (Android; silently ignored on iOS)
     }
 
     // brick collision (one brick per boot per frame)
@@ -596,6 +697,7 @@ function step(){
         const prevX=bt.x-bt.vx;
         const fromSide = prevX+bt.r<=b.x || prevX-bt.r>=b.x+b.w;
         if(fromSide) bt.vx*=-1; else bt.vy*=-1;
+        bt.spinVel*=0.6; // impact bleeds off some spin
         hitBrick(b);
         break;
       }
@@ -711,6 +813,7 @@ function render(){
 }
 
 function startGame(){
+  unlockAudio(); // enable sound on this user gesture
   reset();
   overlay.classList.add("hidden");
   pauseOverlay.classList.remove("show");
@@ -744,6 +847,7 @@ function resumeGame(){
   }
   pauseRemain=null;
   paused=false;
+  paddle.prevX=paddle.x; // avoid a phantom velocity spike on the first frame
   pauseOverlay.classList.remove("show");
   requestAnimationFrame(step);
 }
@@ -807,7 +911,7 @@ startBtn.addEventListener("click",startGame);
 
 // initial idle render
 paddle={w:paddleBaseW,h:16,x:W/2-paddleBaseW/2,y:H-60};
-boot={x:W/2,y:H-120,r:18,vx:0,vy:0,angle:0,spin:0};
+boot={x:W/2,y:H-120,r:18,vx:0,vy:0,angle:0,spinVel:0};
 boots=[boot];particles=[];bricks=[];powerups=[];
 render();
 </script>
