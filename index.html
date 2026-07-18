@@ -111,6 +111,7 @@ const BRICK_SOUND={
 function playBrickSound(shape){ (BRICK_SOUND[shape]||BRICK_SOUND.rect)(); }
 function playPaddleSound(){ blip(180,"square",0.05,0.14, 260); } // short pong
 function playPowerupSound(){ blip(523,"square",0.12,0.16, 1046); } // pickup arpeggio-ish
+function playAntiSound(){ blip(200,"sawtooth",0.22,0.18, 70); }    // low descending buzz (bad)
 function playLevelSound(){ blip(392,"square",0.12,0.16, 784); }
 
 // ---------- haptics ----------
@@ -147,9 +148,16 @@ let bricksAtLevelStart=0;  // to schedule drops across the level
 
 // timed effects
 let paddleBaseW=110;       // normal paddle width
-let widePaddleUntil=0;     // timestamp; while > now, paddle is widened
-let slowUntil=0;           // timestamp; while > now, time is slowed
+let widePaddleUntil=0;     // timestamp; while > now, paddle is widened (bonus)
+let narrowUntil=0;         // while > now, paddle is narrowed (anti-bonus)
+let slowUntil=0;           // while > now, time is slowed (bonus)
+let fastUntil=0;           // while > now, boots are sped up (anti-bonus)
+let stickyUntil=0;         // while > now, boot sticks to paddle on contact (bonus)
+let invertUntil=0;         // while > now, paddle controls are inverted (anti-bonus)
+let shield=false;          // one-time safety net at the bottom (bonus)
+let stuckBoots=[];         // boots currently stuck to the paddle, awaiting launch
 const SLOW_FACTOR=0.5;     // boots move at 50% speed during slow-mo
+const FAST_FACTOR=1.6;     // boots move faster during speed-up anti-bonus
 
 // ---- physics tuning (kept conservative so the game stays controllable) ----
 const PADDLE_TRANSFER = 0.35;  // how much of the paddle's horizontal speed passes to the boot
@@ -160,12 +168,20 @@ const SPIN_DECAY      = 0.985; // spin fades each frame (air resistance)
 const MAX_SPIN        = 6;     // clamp so curves never get silly
 const MAX_VX_RATIO    = 2.2;   // cap horizontal speed relative to boot.speed
 
-// power-up types
-const POW_TYPES=["multiball","widepaddle","slowmo"];
+// power-up types, split into good (bonuses) and bad (anti-bonuses)
+const BONUS_TYPES=["multiball","widepaddle","slowmo","sticky","shield"];
+const ANTI_TYPES=["fast","narrow","invert"];
 const POW_STYLE={
-  multiball:  {color:"#ffd54a", ring:"#a8791f", label:"+1"},
-  widepaddle: {color:"#5ad1ff", ring:"#2f7fa0", label:"W"},
-  slowmo:     {color:"#b58cff", ring:"#6a4fb0", label:"S"}
+  // bonuses (bright, friendly colors)
+  multiball:  {color:"#ffd54a", ring:"#a8791f", label:"+1",  bad:false},
+  widepaddle: {color:"#5ad1ff", ring:"#2f7fa0", label:"W",   bad:false},
+  slowmo:     {color:"#b58cff", ring:"#6a4fb0", label:"S",   bad:false},
+  sticky:     {color:"#7dffb0", ring:"#2f9a63", label:"G",   bad:false},
+  shield:     {color:"#9ad0ff", ring:"#3a6ea8", label:"U",   bad:false},
+  // anti-bonuses (red, skull mark)
+  fast:       {color:"#ff5a5a", ring:"#a02020", label:"skull", bad:true},
+  narrow:     {color:"#ff5a5a", ring:"#a02020", label:"skull", bad:true},
+  invert:     {color:"#ff5a5a", ring:"#a02020", label:"skull", bad:true}
 };
 
 // ---- colors per shape ----
@@ -238,7 +254,8 @@ function reset(){
   score=0;level=1;
   countdown=0;countdownUntil=0;
   paddleBaseW=110;
-  widePaddleUntil=0;slowUntil=0;
+  widePaddleUntil=0;slowUntil=0;narrowUntil=0;fastUntil=0;stickyUntil=0;invertUntil=0;
+  shield=false;stuckBoots=[];
   paddle={w:paddleBaseW,h:16,x:W/2-paddleBaseW/2,y:H-60,vx:0,prevX:W/2-paddleBaseW/2};
   boots=[];powerups=[];dropsThisLevel=0;
   spawnBoot();
@@ -264,9 +281,29 @@ function spawnParticles(x,y,color){
   for(let i=0;i<14;i++)particles.push({x,y,vx:(Math.random()*2-1)*5,vy:(Math.random()*2-1)*5,life:1,color});
 }
 
-function moveTo(clientX){const rect=canvas.getBoundingClientRect();const x=clientX-rect.left;paddle.x=Math.max(0,Math.min(W-paddle.w,x-paddle.w/2));}
+function moveTo(clientX){
+  const rect=canvas.getBoundingClientRect();
+  let x=clientX-rect.left;
+  // inverted controls (anti-bonus): mirror the target position
+  if(performance.now() < invertUntil){ x = W - x; }
+  paddle.x=Math.max(0,Math.min(W-paddle.w,x-paddle.w/2));
+}
 canvas.addEventListener("mousemove",e=>{if(running&&!paused)moveTo(e.clientX);});
 canvas.addEventListener("touchmove",e=>{if(running&&!paused&&e.touches[0]){moveTo(e.touches[0].clientX);e.preventDefault();}},{passive:false});
+// launch any stuck boots on tap/click (sticky paddle bonus)
+function launchStuck(){
+  if(!running||paused||!stuckBoots.length) return;
+  for(const bt of stuckBoots){
+    bt.stuck=false;
+    bt.vy=-Math.abs(bt.speed);
+    bt.vx=(bt.stickOffset||0)*0.08; // aim based on where it sat on the paddle
+    bt.spinVel=0;
+  }
+  stuckBoots=[];
+  playPaddleSound();
+}
+canvas.addEventListener("mousedown",e=>{if(stuckBoots.length)launchStuck();});
+canvas.addEventListener("touchstart",e=>{if(stuckBoots.length){launchStuck();}},{passive:true});
 
 function drawBoot(b){
   ctx.save();
@@ -451,17 +488,14 @@ function planLevelDrops(){
   dropThresholds=[];
   dropQuota=0;
   if(level<2) return;
-  // roll the count: ~30% none, ~45% one, ~25% two
-  const r=Math.random();
-  if(r<0.30) dropQuota=0;
-  else if(r<0.75) dropQuota=1;
-  else dropQuota=2;
-  // pick random progress points for each planned drop, kept apart a bit
+  // evenly random count 0..4 (each equally likely = "maximally random")
+  dropQuota=Math.floor(Math.random()*5); // 0,1,2,3,4
+  // pick random progress points for each planned drop, spread across the level
   for(let i=0;i<dropQuota;i++){
-    // spread across the level: 0.2..0.85, with some randomness
-    const base = dropQuota===2 ? (i===0?0.25:0.65) : 0.4;
-    const jitter = (Math.random()*2-1)*0.15;
-    dropThresholds.push(Math.min(0.9, Math.max(0.1, base+jitter)));
+    // evenly spread base points with jitter so they don't clump
+    const base = dropQuota>0 ? (i+1)/(dropQuota+1) : 0.5;
+    const jitter = (Math.random()*2-1)*0.12;
+    dropThresholds.push(Math.min(0.92, Math.max(0.08, base+jitter)));
   }
   dropThresholds.sort((a,b)=>a-b);
 }
@@ -482,8 +516,9 @@ function maybeDropPowerup(x,y){
 function spawnPowerup(x,y){
   if(dropsThisLevel>=dropQuota) return;
   dropsThisLevel++;
-  const type=POW_TYPES[Math.floor(Math.random()*POW_TYPES.length)];
-  // movement style: some fall straight, some drift/zigzag unpredictably
+  // 50/50 whether this drop is a bonus or an anti-bonus, then random type within
+  const pool = Math.random()<0.5 ? BONUS_TYPES : ANTI_TYPES;
+  const type = pool[Math.floor(Math.random()*pool.length)];
   const wobble = Math.random()<0.5;
   powerups.push({
     x, y, r:13, type,
@@ -506,16 +541,36 @@ function applyPowerup(type){
     nb.vx = (Math.random()*2-1)*2;
     boots.push(nb);
   } else if(type==="widepaddle"){
-    widePaddleUntil = now + 10000; // 10 seconds
+    narrowUntil=0;                 // wide cancels narrow
+    widePaddleUntil = now + 10000;
   } else if(type==="slowmo"){
-    slowUntil = now + 10000; // 10 seconds
+    fastUntil=0;                   // slow cancels fast
+    slowUntil = now + 10000;
+  } else if(type==="sticky"){
+    stickyUntil = now + 10000;
+  } else if(type==="shield"){
+    shield = true;                 // one-time save, no timer
+  } else if(type==="fast"){
+    slowUntil=0;                   // fast cancels slow
+    fastUntil = now + 10000;
+  } else if(type==="narrow"){
+    widePaddleUntil=0;             // narrow cancels wide
+    narrowUntil = now + 10000;
+  } else if(type==="invert"){
+    invertUntil = now + 6000;      // 6 seconds of inverted controls
   }
-  // catch sparkle
+
   const st=POW_STYLE[type];
+  // catch sparkle
   for(let i=0;i<18;i++)particles.push({x:paddle.x+paddle.w/2,y:paddle.y,
     vx:(Math.random()*2-1)*5,vy:(Math.random()*2-1)*5,life:1,color:st.color});
-  playPowerupSound();
-  vibrate([10,30,10]); // little double buzz on pickup
+  if(st.bad){
+    playAntiSound();
+    vibrate([40,40,40]); // harsher buzz for a bad pickup
+  } else {
+    playPowerupSound();
+    vibrate([10,30,10]);
+  }
 }
 
 // advance and collide power-ups; returns nothing, mutates powerups
@@ -561,10 +616,31 @@ function drawPowerup(p){
   g.addColorStop(0,"#ffffff");g.addColorStop(0.35,st.color);g.addColorStop(1,st.ring);
   ctx.fillStyle=g;ctx.strokeStyle=st.ring;ctx.lineWidth=2;
   ctx.beginPath();ctx.arc(0,0,p.r,0,7);ctx.fill();ctx.stroke();
-  // label
-  ctx.fillStyle="#20143a";ctx.font="700 12px system-ui,sans-serif";
-  ctx.textAlign="center";ctx.textBaseline="middle";
-  ctx.fillText(st.label,0,1);
+  // label: skull icon for anti-bonuses, letter/symbol for bonuses
+  if(st.label==="skull"){
+    drawSkull(0,0,p.r*0.9);
+  } else {
+    ctx.fillStyle="#20143a";ctx.font="700 12px system-ui,sans-serif";
+    ctx.textAlign="center";ctx.textBaseline="middle";
+    ctx.fillText(st.label,0,1);
+  }
+  ctx.restore();
+}
+
+// simple retro skull drawn on the powerup
+function drawSkull(cx,cy,s){
+  ctx.save();
+  ctx.translate(cx,cy);
+  ctx.fillStyle="#1a0a0a";
+  // head
+  ctx.beginPath();ctx.arc(0,-s*0.15,s*0.6,Math.PI,0);ctx.fill();
+  ctx.fillRect(-s*0.6,-s*0.15,s*1.2,s*0.55);
+  // jaw
+  ctx.fillRect(-s*0.35,s*0.4,s*0.7,s*0.25);
+  // eyes
+  ctx.fillStyle="#ff5a5a";
+  ctx.beginPath();ctx.arc(-s*0.28,-s*0.05,s*0.16,0,7);ctx.fill();
+  ctx.beginPath();ctx.arc( s*0.28,-s*0.05,s*0.16,0,7);ctx.fill();
   ctx.restore();
 }
 
@@ -577,7 +653,9 @@ function nextLevel(keepSpeed){
   dropsThisLevel=0;
   planLevelDrops();
   powerups=[];               // clear uncaught drops
-  widePaddleUntil=0;slowUntil=0; // effects don't carry across levels
+  // effects don't carry across levels
+  widePaddleUntil=0;slowUntil=0;narrowUntil=0;fastUntil=0;stickyUntil=0;invertUntil=0;
+  stuckBoots=[];shield=false;
   paddle.w=paddleBaseW;paddle.x=Math.max(0,Math.min(W-paddle.w,paddle.x));
   // new level starts at 75% of the speed carried from the previous level
   const carried = keepSpeed!=null ? keepSpeed*0.75 : null;
@@ -615,17 +693,27 @@ function step(){
     }
   }
 
-  // timed paddle width
-  const wide = now < widePaddleUntil;
-  const targetW = wide ? paddleBaseW*1.25 : paddleBaseW;
+  // timed paddle width: wide (bonus) or narrow (anti-bonus)
+  let widthMul=1;
+  if(now < widePaddleUntil) widthMul=1.25;
+  else if(now < narrowUntil) widthMul=0.75;
+  const targetW = paddleBaseW*widthMul;
   if(paddle.w!==targetW){
     const cx=paddle.x+paddle.w/2;
     paddle.w=targetW;
     paddle.x=Math.max(0,Math.min(W-paddle.w,cx-paddle.w/2));
   }
 
-  // time scale (slow-mo affects boot movement only)
-  const scale = (now < slowUntil) ? SLOW_FACTOR : 1;
+  // time scale: slow-mo (bonus) or speed-up (anti-bonus) on boot movement
+  let scale = 1;
+  if(now < slowUntil) scale = SLOW_FACTOR;
+  else if(now < fastUntil) scale = FAST_FACTOR;
+
+  // stuck boots ride along with the paddle until launched
+  for(const bt of stuckBoots){
+    bt.x = paddle.x + paddle.w/2 + (bt.stickOffset||0);
+    bt.y = paddle.y - bt.r - 1;
+  }
 
   // paddle horizontal velocity (how fast the player is sweeping it this frame)
   paddle.vx = paddle.x - paddle.prevX;
@@ -633,6 +721,7 @@ function step(){
 
   // ---- move & collide every active boot ----
   for(const bt of boots){
+    if(bt.stuck) continue; // stuck boots ride the paddle, handled above
     // Magnus effect: spin curves the horizontal velocity mid-flight
     bt.vx += bt.spinVel * MAGNUS_K * scale;
     // clamp horizontal speed so curves stay playable
@@ -662,6 +751,16 @@ function step(){
     // paddle collision
     if(bt.vy>0 && bt.y+bt.r>=paddle.y && bt.y+bt.r<=paddle.y+paddle.h+14 &&
        bt.x>=paddle.x-bt.r && bt.x<=paddle.x+paddle.w+bt.r){
+      // sticky paddle: catch the boot and wait for a launch tap
+      if(now < stickyUntil){
+        bt.stuck=true;
+        bt.stickOffset = bt.x - (paddle.x+paddle.w/2);
+        bt.vx=0;bt.vy=0;bt.spinVel=0;
+        bt.y=paddle.y-bt.r-1;
+        if(!stuckBoots.includes(bt)) stuckBoots.push(bt);
+        playPaddleSound();
+        vibrate(15);
+      } else {
       const hit=(bt.x-(paddle.x+paddle.w/2))/(paddle.w/2); // -1..1 across paddle
       bt.speed+=0.125; // gradual speed ramp per touch
 
@@ -687,6 +786,7 @@ function step(){
       spawnParticles(bt.x,bt.y,"#ffd54a");
       playPaddleSound();
       vibrate(15); // light tap on bounce (Android; silently ignored on iOS)
+      }
     }
 
     // brick collision (one brick per boot per frame)
@@ -704,8 +804,25 @@ function step(){
     }
   }
 
+  // shield: if a boot is about to fall past the bottom, bounce it once and consume shield
+  if(shield){
+    for(const bt of boots){
+      if(bt.y-bt.r>H-6 && bt.vy>0){
+        bt.y=H-bt.r-8;
+        bt.vy=-Math.abs(bt.vy || bt.speed);
+        if(Math.abs(bt.vy)<2) bt.vy=-2;
+        shield=false;
+        spawnParticles(bt.x,H-6,"#9ad0ff");
+        playPaddleSound();
+        vibrate([20,20,20]);
+        break;
+      }
+    }
+  }
+
   // remove boots that fell below the screen
   boots = boots.filter(bt=>bt.y-bt.r<=H);
+  stuckBoots = stuckBoots.filter(bt=>boots.includes(bt));
   boot = boots[0] || boot; // keep legacy mirror pointing at an active boot
 
   // all boots lost -> game over
@@ -791,6 +908,15 @@ function render(){
   ctx.globalAlpha=1;
 
   // falling power-ups
+  // shield: glowing safety line near the bottom
+  if(shield){
+    ctx.save();
+    ctx.strokeStyle="rgba(154,208,255,.8)";ctx.lineWidth=3;
+    ctx.shadowColor="#9ad0ff";ctx.shadowBlur=10;
+    ctx.beginPath();ctx.moveTo(6,H-6);ctx.lineTo(W-6,H-6);ctx.stroke();
+    ctx.restore();
+  }
+
   for(const p of powerups) drawPowerup(p);
 
   // all active boots
@@ -800,7 +926,12 @@ function render(){
   const now=performance.now();
   const badges=[];
   if(now<widePaddleUntil) badges.push({t:"Широка ракетка", ms:widePaddleUntil-now, c:"#5ad1ff"});
+  if(now<narrowUntil) badges.push({t:"Вузька ракетка", ms:narrowUntil-now, c:"#ff5a5a"});
   if(now<slowUntil) badges.push({t:"Уповільнення", ms:slowUntil-now, c:"#b58cff"});
+  if(now<fastUntil) badges.push({t:"Прискорення", ms:fastUntil-now, c:"#ff5a5a"});
+  if(now<stickyUntil) badges.push({t:"Липка ракетка", ms:stickyUntil-now, c:"#7dffb0"});
+  if(now<invertUntil) badges.push({t:"Інверсія!", ms:invertUntil-now, c:"#ff5a5a"});
+  if(shield) badges.push({t:"Щит", ms:null, c:"#9ad0ff"});
   if(boots.length>1) badges.push({t:"Ботинки: "+boots.length, ms:null, c:"#ffd54a"});
   ctx.textAlign="right";ctx.textBaseline="top";ctx.font="600 13px system-ui,sans-serif";
   badges.forEach((bd,i)=>{
@@ -827,10 +958,15 @@ function pauseGame(){
   if(!running || paused) return;
   paused=true;
   const now=performance.now();
+  const rem=(until)=> until>now ? until-now : 0;
   // freeze timed effects by remembering how much time was left
   pauseRemain={
-    wide: widePaddleUntil>now ? widePaddleUntil-now : 0,
-    slow: slowUntil>now ? slowUntil-now : 0,
+    wide: rem(widePaddleUntil),
+    narrow: rem(narrowUntil),
+    slow: rem(slowUntil),
+    fast: rem(fastUntil),
+    sticky: rem(stickyUntil),
+    invert: rem(invertUntil),
     countdown: (countdown>0 && countdownUntil>now) ? countdownUntil-now : 0
   };
   pauseOverlay.classList.add("show");
@@ -841,9 +977,14 @@ function resumeGame(){
   const now=performance.now();
   // restore timed effects relative to the new clock
   if(pauseRemain){
-    widePaddleUntil = pauseRemain.wide>0 ? now+pauseRemain.wide : 0;
-    slowUntil       = pauseRemain.slow>0 ? now+pauseRemain.slow : 0;
-    if(pauseRemain.countdown>0){ countdownUntil = now+pauseRemain.countdown; }
+    const r=pauseRemain;
+    widePaddleUntil = r.wide>0 ? now+r.wide : 0;
+    narrowUntil     = r.narrow>0 ? now+r.narrow : 0;
+    slowUntil       = r.slow>0 ? now+r.slow : 0;
+    fastUntil       = r.fast>0 ? now+r.fast : 0;
+    stickyUntil     = r.sticky>0 ? now+r.sticky : 0;
+    invertUntil     = r.invert>0 ? now+r.invert : 0;
+    if(r.countdown>0){ countdownUntil = now+r.countdown; }
   }
   pauseRemain=null;
   paused=false;
